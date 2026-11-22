@@ -7,31 +7,49 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December'];
 
 const HTML_ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-// Escapable-after-backslash set (14 chars).
+// Constant whitespace table for /\s/ (JS): single array lookup per char.
+// Module-level constant, not input-keyed state.
+const WS_TABLE = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS_TABLE[c] = 1;
+for (let c = 8192; c <= 8202; c++) WS_TABLE[c] = 1;
+
+const ESC_HTML_RE = /[&<>"']/g;
+const INLINE_RE = /[\\`*\[&<>"']/g;
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 const KNOWN_KEYS = new Set(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
 
 const BLANK_RE = /^[ \t]*$/;
-const FENCE_RE = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE_RE = /^```[ \t]*$/;
-const HEADING_RE = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
-const HR_RE = /^(?:---|\*\*\*)[ \t]*$/;
-const BULLET_RE = /^[-*] (.*)$/;
-const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
-const CONTINUATION_RE = /^ {2,}\S/;
 const FM_LINE_RE = /^([a-z_]+):(?: (.*))?$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const LAYOUT_RE = /^[a-z0-9-]+$/;
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
-const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const FOR_RE = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
 const IF_RE = /^if (not )?(\S+)$/;
 const INCLUDE_RE = /^include "([a-z0-9-]+)"$/;
 
 function escChar(c) { return HTML_ESC[c] || c; }
-function escapeHtml(t) { return t.replace(/[&<>"']/g, (ch) => HTML_ESC[ch]); }
-function trimST(s) { return s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, ''); }
+// Fast escape: native regex scan; chunks with no special char are copied
+// verbatim, and a string with no special char is returned as-is.
+function escapeHtml(t) {
+  ESC_HTML_RE.lastIndex = 0;
+  let m;
+  let out = '';
+  let last = 0;
+  while ((m = ESC_HTML_RE.exec(t)) !== null) {
+    if (m.index > last) out += t.slice(last, m.index);
+    out += HTML_ESC[m[0]];
+    last = m.index + 1;
+  }
+  return last === 0 ? t : out + t.slice(last);
+}
+function trimST(s) {
+  let a = 0;
+  let b = s.length;
+  while (a < b && (s.charCodeAt(a) === 32 || s.charCodeAt(a) === 9)) a++;
+  while (b > a && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
+  return s.slice(a, b);
+}
 function fail(msg) { throw new Error(msg); }
 
 // ---- 0. Text primitives ----
@@ -40,20 +58,26 @@ function slugify(text) {
   const norm = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
-  for (const ch of norm) {
-    const code = ch.codePointAt(0);
+  for (let i = 0; i < norm.length; i++) {
+    const code = norm.charCodeAt(i);
     if (code >= 65 && code <= 90) { // A-Z
       if (gap) { out += '-'; gap = false; }
-      out += ch.toLowerCase();
+      out += String.fromCharCode(code + 32);
     } else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) { // a-z 0-9
       if (gap) { out += '-'; gap = false; }
-      out += ch;
+      out += norm[i];
     } else {
       if (out !== '') gap = true;
     }
   }
   out = out.slice(0, 64).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
+}
+// Per-run memoised slugify (cache lives and dies inside one run() call).
+function slugCached(cache, text) {
+  let s = cache.get(text);
+  if (s === undefined) { s = slugify(text); cache.set(text, s); }
+  return s;
 }
 
 function uniqueSlug(slug, taken) {
@@ -71,14 +95,33 @@ function longDate(d) {
 }
 
 function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m ? m.length : 0;
+  // Manual /\S+/ count: no regex, no match array allocation.
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    if (WS_TABLE[text.charCodeAt(i)]) inWord = false;
+    else if (!inWord) { inWord = true; count++; }
+  }
+  return count;
 }
 
 function daysInMonth(y, mo) {
   if (mo === 2) return ((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) ? 29 : 28;
   if (mo === 4 || mo === 6 || mo === 9 || mo === 11) return 30;
   return 31;
+}
+
+// /^[A-Za-z][A-Za-z0-9+.-]*:/ — manual scan (hot: every link target).
+function hasScheme(t) {
+  const c0 = t.charCodeAt(0);
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return false;
+  for (let i = 1; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c === 58) return true; // ':'
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+      || c === 43 || c === 45 || c === 46)) return false;
+  }
+  return false;
 }
 
 function dirOf(p) {
@@ -158,18 +201,37 @@ function parseValue(key, raw) {
 }
 
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') fail('no front matter');
+  // Scan lines with indexOf only; the body is sliced, never split,
+  // so a large body costs no line array.
+  const firstNL = text.indexOf('\n');
+  const first = firstNL === -1 ? text : text.slice(0, firstNL);
+  if (first !== '---') fail('no front matter');
   let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') { close = i; break; }
+  let bodyStart = text.length;
+  let pos = firstNL === -1 ? text.length : firstNL + 1;
+  for (let lineIdx = 1; ; lineIdx++) {
+    const nl = text.indexOf('\n', pos);
+    const line = nl === -1 ? text.slice(pos) : text.slice(pos, nl);
+    if (line === '---') { close = lineIdx; bodyStart = nl === -1 ? text.length : nl + 1; break; }
+    if (nl === -1) break;
+    pos = nl + 1;
+    // A line was just consumed; if text ended with '\n', the next
+    // iteration reads the final '' line (never '---'), then stops.
+    if (pos >= text.length) {
+      // One last line remains only when text ends with '\n' (it is '');
+      // it cannot be '---', so stop here.
+      break;
+    }
   }
   if (close === -1) fail('the front matter is not closed');
   const data = {};
   const seen = new Set();
+  pos = firstNL === -1 ? text.length : firstNL + 1;
   for (let i = 1; i < close; i++) {
-    const line = lines[i];
-    if (BLANK_RE.test(line)) continue;
+    const nl = text.indexOf('\n', pos);
+    const line = nl === -1 ? text.slice(pos) : text.slice(pos, nl);
+    pos = nl === -1 ? text.length : nl + 1;
+    if (isBlankLine(line)) continue;
     if (line[0] === '#') continue;
     const m = FM_LINE_RE.exec(line);
     if (!m) fail('line ' + (i + 1) + ' is not "key: value"');
@@ -182,7 +244,7 @@ function parseFrontMatter(text) {
     data[key] = parseValue(key, raw);
   }
   if (!Object.hasOwn(data, 'title')) fail('no title');
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: text.slice(bodyStart) };
 }
 
 // ---- 6. Markdown ----
@@ -207,181 +269,266 @@ function findSingleStar(s, from) {
 }
 
 function inline(s, linkFn) {
-  let out = '';
+  // Jump between special chars with a native regex scan instead of a
+  // per-char JS loop. lastIndex is (re)set before every exec, so the
+  // recursive inline() calls for strong/em/link contents cannot corrupt
+  // this call's scan position. Plain runs between specials are sliced
+  // verbatim (no HTML special can hide in them); a lone \, `, * or [
+  // that fails its construct stays inside the chunk, exactly the literal
+  // output the char-by-char version produced.
+  const out = [];
   let i = 0;
+  let last = 0;
   const n = s.length;
+  const flush = (to) => { if (last < to) out.push(s.slice(last, to)); };
   while (i < n) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-      out += escChar(s[i + 1]);
-      i += 2;
+    INLINE_RE.lastIndex = i;
+    const m = INLINE_RE.exec(s);
+    if (m === null) break;
+    i = m.index;
+    const code = s.charCodeAt(i);
+    if (code === 92) { // backslash
+      if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
+        flush(i);
+        out.push(escChar(s[i + 1]));
+        i += 2;
+        last = i;
+      } else i++;
       continue;
     }
-    if (c === '`') {
+    if (code === 96) { // backtick
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        out += '<code>' + escapeHtml(s.slice(i + 1, j)) + '</code>';
+        flush(i);
+        out.push('<code>' + escapeHtml(s.slice(i + 1, j)) + '</code>');
         i = j + 1;
-        continue;
-      }
-      out += '`';
-      i++;
+        last = i;
+      } else i++;
       continue;
     }
-    if (c === '*') {
+    if (code === 42) { // *
       if (s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          out += '<strong>' + inline(s.slice(i + 2, j), linkFn) + '</strong>';
+          flush(i);
+          out.push('<strong>' + inline(s.slice(i + 2, j), linkFn) + '</strong>');
           i = j + 2;
-          continue;
-        }
-        out += '**';
-        i += 2;
+          last = i;
+        } else i += 2;
         continue;
       }
       const j = findSingleStar(s, i + 1);
       if (j > i + 1) {
-        out += '<em>' + inline(s.slice(i + 1, j), linkFn) + '</em>';
+        flush(i);
+        out.push('<em>' + inline(s.slice(i + 1, j), linkFn) + '</em>');
         i = j + 1;
-        continue;
-      }
-      out += '*';
-      i++;
+        last = i;
+      } else i++;
       continue;
     }
-    if (c === '[') {
+    if (code === 91) { // [
       const k = findUnescaped(s, ']', i + 1);
-      let m = -1;
-      if (k !== -1 && s[k + 1] === '(') m = s.indexOf(')', k + 2);
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      let mm = -1;
+      if (k !== -1 && s[k + 1] === '(') mm = s.indexOf(')', k + 2);
+      const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !/\s/.test(target)) {
-        out += '<a href="' + escapeHtml(linkFn(target)) + '">' + inline(s.slice(i + 1, k), linkFn) + '</a>';
-        i = m + 1;
-        continue;
-      }
-      out += '[';
-      i++;
+        flush(i);
+        out.push('<a href="' + escapeHtml(linkFn(target)) + '">' + inline(s.slice(i + 1, k), linkFn) + '</a>');
+        i = mm + 1;
+        last = i;
+      } else i++;
       continue;
     }
-    out += escChar(c);
+    // & < > " ' — an HTML special.
+    flush(i);
+    out.push(HTML_ESC[s[i]]);
     i++;
+    last = i;
   }
-  return out;
+  flush(n);
+  return out.join('');
 }
 
-function lexBlocks(body) {
+function isBlankLine(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+function isWSCode(c) { // JS \s (lines never contain \n/\r, included anyway)
+  return c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13
+    || c === 160 || c === 5760 || (c >= 8192 && c <= 8202) || c === 8232
+    || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
+}
+// Manual equivalents of the block regexes (hot: every source line).
+function fenceOpen(line) { // returns lang string, or null
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  const lang = line.slice(3, i);
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return null;
+    i++;
+  }
+  return lang;
+}
+function fenceClose(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+function headingInfo(line) { // returns {depth, text}, or null
+  let i = 0;
+  while (i < line.length && line.charCodeAt(i) === 35) i++;
+  if (i === 0 || i > 6) return null;
+  if (i >= line.length) return null;
+  const c = line.charCodeAt(i);
+  if (c !== 32 && c !== 9) return null;
+  let j = i;
+  while (j < line.length && (line.charCodeAt(j) === 32 || line.charCodeAt(j) === 9)) j++;
+  if (j >= line.length) return null;
+  let end = line.length;
+  while (end > j && (line.charCodeAt(end - 1) === 32 || line.charCodeAt(end - 1) === 9)) end--;
+  return { depth: i, text: line.slice(j, end) };
+}
+function isHr(line) {
+  const c0 = line.charCodeAt(0);
+  if (c0 !== 45 && c0 !== 42) return false; // '-' or '*'
+  if (line.charCodeAt(1) !== c0 || line.charCodeAt(2) !== c0) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+function bulletInfo(line) { // returns item text, or null
+  const c0 = line.charCodeAt(0);
+  if ((c0 === 45 || c0 === 42) && line.charCodeAt(1) === 32) return line.slice(2);
+  return null;
+}
+function orderedInfo(line) { // returns {start, text}, or null
+  let i = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c >= 48 && c <= 57) i++;
+    else break;
+  }
+  if (i === 0 || i > 9) return null;
+  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null; // '. '
+  return { start: Number(line.slice(0, i)), text: line.slice(i + 2) };
+}
+function isContinuation(line) {
+  let i = 0;
+  while (i < line.length && line.charCodeAt(i) === 32) i++;
+  if (i < 2 || i >= line.length) return false;
+  return !isWSCode(line.charCodeAt(i));
+}
+
+function renderMarkdown(body, linkFn, slugCache) {
+  // Lex + render fused in one pass: no intermediate block objects, no
+  // second walk. Block boundaries and rendering are exactly S1's.
   const lines = body.split('\n');
-  const blocks = [];
+  const ids = new Set();
+  const toc = [];
+  let excerpt = '';
+  let seenPara = false;
+  const out = [];
   let i = 0;
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (BLANK_RE.test(line)) { i++; continue; }
-    let m = FENCE_RE.exec(line);
-    if (m) {
-      const lang = m[1];
+    if (isBlankLine(line)) { i++; continue; }
+    const lang = fenceOpen(line);
+    if (lang !== null) {
       const bl = [];
       i++;
-      while (i < n && !FENCE_CLOSE_RE.test(lines[i])) { bl.push(lines[i]); i++; }
+      while (i < n && !fenceClose(lines[i])) { bl.push(lines[i]); i++; }
       if (i < n) i++; // consume closing fence
-      blocks.push({ kind: 'code', lang, body: bl });
+      let s = '<pre><code' + (lang === '' ? '' : ' class="language-' + escapeHtml(lang) + '"') + '>';
+      for (const l of bl) { s += escapeHtml(l); s += '\n'; }
+      s += '</code></pre>\n';
+      out.push(s);
       continue;
     }
-    m = HEADING_RE.exec(line);
-    if (m && m[2] !== '') {
-      blocks.push({ kind: 'heading', depth: m[1].length, text: m[2] });
+    const hd = headingInfo(line);
+    if (hd !== null) {
+      const id = uniqueSlug(slugCached(slugCache, hd.text), ids);
+      const html = inline(hd.text, linkFn);
+      out.push('<h' + hd.depth + ' id="' + id + '">' + html + '</h' + hd.depth + '>\n');
+      if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
       i++;
       continue;
     }
-    if (HR_RE.test(line)) { blocks.push({ kind: 'hr' }); i++; continue; }
+    if (isHr(line)) { out.push('<hr>\n'); i++; continue; }
     if (line.charCodeAt(0) === 62) { // '>'
       const ql = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
-        const t = trimST(lines[i].replace(/^> ?/, ''));
+        let t = lines[i].slice(1);
+        if (t.charCodeAt(0) === 32) t = t.slice(1);
+        t = trimST(t);
         if (t !== '') ql.push(t);
         i++;
       }
-      blocks.push({ kind: 'blockquote', lines: ql });
+      if (ql.length === 0) out.push('<blockquote>\n</blockquote>\n');
+      else out.push('<blockquote>\n<p>' + inline(ql.join('\n'), linkFn) + '</p>\n</blockquote>\n');
       continue;
     }
-    let lm = BULLET_RE.exec(line);
+    let bText = bulletInfo(line);
+    let oInfo = null;
     let ordered = false;
-    if (!lm) { lm = ORDERED_RE.exec(line); ordered = lm !== null; }
-    if (lm) {
-      const start = ordered ? Number(lm[1]) : 1;
-      const items = [];
-      let parts = [trimST(ordered ? lm[2] : lm[1])];
+    if (bText === null) { oInfo = orderedInfo(line); ordered = oInfo !== null; }
+    if (bText !== null || oInfo !== null) {
+      const tag = ordered ? 'ol' : 'ul';
+      const open = ordered && oInfo.start !== 1 ? '<ol start="' + oInfo.start + '">' : '<' + tag + '>';
+      let s = open + '\n';
+      let parts = [trimST(ordered ? oInfo.text : bText)];
       i++;
-      while (i < n) {
+      for (;;) {
+        if (i >= n) { s += '<li>' + inline(parts.join('\n'), linkFn) + '</li>\n'; break; }
         const l = lines[i];
-        const im = ordered ? ORDERED_RE.exec(l) : BULLET_RE.exec(l);
-        if (im) {
-          items.push(parts.join('\n'));
-          parts = [trimST(ordered ? im[2] : im[1])];
+        let im = null;
+        let oim = null;
+        if (ordered) oim = orderedInfo(l);
+        else im = bulletInfo(l);
+        if (im !== null || oim !== null) {
+          s += '<li>' + inline(parts.join('\n'), linkFn) + '</li>\n';
+          parts = [trimST(ordered ? oim.text : im)];
           i++;
-        } else if (CONTINUATION_RE.test(l)) {
+        } else if (isContinuation(l)) {
           parts.push(trimST(l));
           i++;
-        } else break;
+        } else {
+          s += '<li>' + inline(parts.join('\n'), linkFn) + '</li>\n';
+          break;
+        }
       }
-      items.push(parts.join('\n'));
-      blocks.push({ kind: 'list', ordered, start, items });
+      s += '</' + tag + '>\n';
+      out.push(s);
       continue;
     }
     // Paragraph: collect until blank, fence-open, heading, or thematic break.
     const pl = [];
     while (i < n) {
       const l = lines[i];
-      if (BLANK_RE.test(l)) break;
-      if (FENCE_RE.test(l)) break;
-      const hm = HEADING_RE.exec(l);
-      if (hm && hm[2] !== '') break;
-      if (HR_RE.test(l)) break;
+      if (isBlankLine(l)) break;
+      if (fenceOpen(l) !== null) break;
+      if (headingInfo(l) !== null) break;
+      if (isHr(l)) break;
       pl.push(trimST(l));
       i++;
     }
-    blocks.push({ kind: 'paragraph', text: pl.join('\n') });
-  }
-  return blocks;
-}
-
-function renderMarkdown(body, linkFn) {
-  const blocks = lexBlocks(body);
-  const ids = new Set();
-  const toc = [];
-  let excerpt = '';
-  let seenPara = false;
-  const out = [];
-  for (const b of blocks) {
-    if (b.kind === 'heading') {
-      const id = uniqueSlug(slugify(b.text), ids);
-      const html = inline(b.text, linkFn);
-      out.push('<h' + b.depth + ' id="' + id + '">' + html + '</h' + b.depth + '>\n');
-      if (b.depth === 2 || b.depth === 3) toc.push({ level: b.depth, id, html });
-    } else if (b.kind === 'code') {
-      const cls = b.lang === '' ? '' : ' class="language-' + escapeHtml(b.lang) + '"';
-      let s = '<pre><code' + cls + '>';
-      for (const l of b.body) { s += escapeHtml(l); s += '\n'; }
-      s += '</code></pre>\n';
-      out.push(s);
-    } else if (b.kind === 'hr') {
-      out.push('<hr>\n');
-    } else if (b.kind === 'blockquote') {
-      if (b.lines.length === 0) out.push('<blockquote>\n</blockquote>\n');
-      else out.push('<blockquote>\n<p>' + inline(b.lines.join('\n'), linkFn) + '</p>\n</blockquote>\n');
-    } else if (b.kind === 'list') {
-      const tag = b.ordered ? 'ol' : 'ul';
-      const open = b.ordered && b.start !== 1 ? '<ol start="' + b.start + '">' : '<' + tag + '>';
-      let s = open + '\n';
-      for (const it of b.items) s += '<li>' + inline(it, linkFn) + '</li>\n';
-      s += '</' + tag + '>\n';
-      out.push(s);
-    } else if (b.kind === 'paragraph') {
-      const html = inline(b.text, linkFn);
-      if (!seenPara) { excerpt = html; seenPara = true; }
-      out.push('<p>' + html + '</p>\n');
-    }
+    const html = inline(pl.join('\n'), linkFn);
+    if (!seenPara) { excerpt = html; seenPara = true; }
+    out.push('<p>' + html + '</p>\n');
   }
   return { html: out.join(''), toc, excerpt };
 }
@@ -532,11 +679,23 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       const xs = lookup(scope, node.path);
       if (Array.isArray(xs)) {
         const len = xs.length;
+        // Reuse one vars/loop/scope object across iterations: rendering is
+        // synchronous depth-first, and every body render follows a fresh
+        // assignment of the loop variable and loop fields, so no iteration
+        // can observe a stale value.
+        const vars = {};
+        const loop = { index: 1, first: true, last: len === 1, length: len };
+        vars[node.name] = xs[0];
+        vars.loop = loop;
+        const childScope = { vars, parent: scope };
         for (let k = 0; k < len; k++) {
-          const vars = {};
-          vars[node.name] = xs[k];
-          vars.loop = { index: k + 1, first: k === 0, last: k === len - 1, length: len };
-          renderNodes(node.body, { vars, parent: scope }, ctx, depth, out);
+          if (k !== 0) {
+            vars[node.name] = xs[k];
+            loop.index = k + 1;
+            loop.first = false;
+            loop.last = k === len - 1;
+          }
+          renderNodes(node.body, childScope, ctx, depth, out);
         }
       }
     } else if (node.kind === 'include') {
@@ -557,7 +716,7 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, content: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, content: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n') });
     else statics.push(f);
   }
 
@@ -593,6 +752,10 @@ export function run(input) {
     kept.push({ path: src.path, data, body, isPost, layout });
   }
 
+  // Per-run caches (live and die inside this run() call only).
+  const slugCache = new Map();
+  const cardCache = new Map();
+
   // 4. Permalinks.
   const dirTaken = new Map();
   for (const k of kept) {
@@ -604,7 +767,7 @@ export function run(input) {
       dirTaken.set(dir, taken);
     }
     k.dir = dir;
-    const baseSlug = Object.hasOwn(k.data, 'slug') ? k.data.slug : slugify(k.data.title);
+    const baseSlug = Object.hasOwn(k.data, 'slug') ? k.data.slug : slugCached(slugCache, k.data.title);
     k.slug = uniqueSlug(baseSlug, taken);
     k.outPath = dir === '' ? k.slug + '/index.html' : dir + '/' + k.slug + '/index.html';
     k.url = dir === '' ? base + '/' + k.slug + '/' : base + '/' + dir + '/' + k.slug + '/';
@@ -617,7 +780,7 @@ export function run(input) {
   for (const f of statics) staticPaths.add(f.path);
   const broken = new Set();
   const resolveLink = (target, srcDir, srcPath) => {
-    if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+    if (target.charCodeAt(0) === 47 || target.charCodeAt(0) === 35 || hasScheme(target)) return target;
     const hashIdx = target.indexOf('#');
     const rel = hashIdx === -1 ? target : target.slice(0, hashIdx);
     const frag = hashIdx === -1 ? '' : target.slice(hashIdx);
@@ -645,7 +808,7 @@ export function run(input) {
   for (const k of kept) {
     // Link resolution starts from the source file's own directory
     // (e.g. posts/2018), not the permalink directory (posts).
-    const r = renderMarkdown(k.body, (t) => resolveLink(t, dirOf(k.path), k.path));
+    const r = renderMarkdown(k.body, (t) => resolveLink(t, dirOf(k.path), k.path), slugCache);
     k.content = r.html;
     k.toc = r.toc;
     k.excerpt = r.excerpt;
@@ -669,7 +832,7 @@ export function run(input) {
     const seen = new Set();
     const out = [];
     for (const name of names) {
-      const slug = slugify(name);
+      const slug = slugCached(slugCache, name);
       if (seen.has(slug)) continue;
       seen.add(slug);
       out.push({ name, slug });
@@ -706,16 +869,26 @@ export function run(input) {
     return 0;
   });
 
-  const cardOf = (k) => ({
-    title: k.data.title,
-    url: k.url,
-    date: k.data.date === undefined ? '' : k.data.date,
-    date_long: k.data.date === undefined ? '' : longDate(k.data.date),
-    summary: k.data.summary === undefined ? '' : k.data.summary,
-    excerpt: k.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(k.body) / 200)),
-    tags: k.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+  // One card per source per run: cardOf recomputes wordsOf(body) over the
+  // whole body, so sharing it across index/tag/recent/page renders matters.
+  // pageOf copies it (spread) before adding page-only fields.
+  const cardOf = (k) => {
+    let c = cardCache.get(k);
+    if (c === undefined) {
+      c = {
+        title: k.data.title,
+        url: k.url,
+        date: k.data.date === undefined ? '' : k.data.date,
+        date_long: k.data.date === undefined ? '' : longDate(k.data.date),
+        summary: k.data.summary === undefined ? '' : k.data.summary,
+        excerpt: k.excerpt,
+        reading_minutes: Math.max(1, Math.ceil(wordsOf(k.body) / 200)),
+        tags: k.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      };
+      cardCache.set(k, c);
+    }
+    return c;
+  };
   const linkCard = (p) => {
     if (p === null || p === undefined) return null;
     return {
@@ -726,7 +899,7 @@ export function run(input) {
     };
   };
   const pageOf = (k) => {
-    const c = cardOf(k);
+    const c = { ...cardOf(k) };
     c.slug = k.slug;
     c.content = k.content;
     c.toc = k.toc;
